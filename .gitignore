@@ -1,0 +1,21 @@
+# Dữ liệu và kết quả trung gian
+Dataset/
+mau_thu_nghe/
+baseline_sheikh/work/
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.npy
+*.npz
+*.zip
+
+# Paper và tài liệu
+Paper baseline/
+Fake data and expand/
+*.pdf
+*.docx
+
+# Python
+__pycache__/
+*.pyc
