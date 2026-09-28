@@ -1,0 +1,14 @@
+{
+  "id": "qkhaii/fluenta-baseline-sheikh",
+  "title": "Fluenta baseline Sheikh",
+  "code_file": "run_baseline.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["qkhaii/sep28k-clips-fluenta"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

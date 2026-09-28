@@ -19,3 +19,6 @@ Fake data and expand/
 # Python
 __pycache__/
 *.pyc
+
+# Khóa API, không bao giờ đưa lên git
+kaggle.json
