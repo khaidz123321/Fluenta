@@ -1,12 +1,16 @@
 """Cấu hình chung để tái hiện Sheikh et al. (2023), arXiv:2306.00689, trên SEP-28k."""
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SEP_DIR = ROOT.parent / "Dataset" / "ml-stuttering-events-dataset-main" / "ml-stuttering-events-dataset-main"
+# Trên Kaggle/Modal, đặt FLUENTA_SEP_DIR tới thư mục chứa SEP-28k_labels.csv và clips_output/.
+SEP_DIR = Path(os.environ.get(
+    "FLUENTA_SEP_DIR",
+    ROOT.parent / "Dataset" / "ml-stuttering-events-dataset-main" / "ml-stuttering-events-dataset-main"))
 LABELS_CSV = SEP_DIR / "SEP-28k_labels.csv"
 CLIPS_DIR = SEP_DIR / "clips_output"
 
-WORK_DIR = ROOT / "work"
+WORK_DIR = Path(os.environ.get("FLUENTA_WORK_DIR", ROOT / "work"))
 MANIFEST = WORK_DIR / "manifest.csv"
 FEATURE_DIR = WORK_DIR / "features"
 RESULTS_DIR = WORK_DIR / "results"

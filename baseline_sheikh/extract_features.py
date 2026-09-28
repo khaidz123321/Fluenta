@@ -14,6 +14,7 @@ from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
 import config
 
 CHUNK = 500
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def load_audio(path):
@@ -33,8 +34,8 @@ def stat_pool(h):
 @torch.no_grad()
 def embed_batch(model, fe, wavs):
     inputs = fe(wavs, sampling_rate=config.SAMPLE_RATE, return_tensors="pt", padding=True)
-    out = model(inputs.input_values, output_hidden_states=True)
-    return {name: stat_pool(out.hidden_states[idx]).numpy() for name, idx in config.LAYERS.items()}
+    out = model(inputs.input_values.to(DEVICE), output_hidden_states=True)
+    return {name: stat_pool(out.hidden_states[idx]).cpu().numpy() for name, idx in config.LAYERS.items()}
 
 
 def main():
@@ -47,8 +48,9 @@ def main():
 
     config.FEATURE_DIR.mkdir(parents=True, exist_ok=True)
     fe = Wav2Vec2FeatureExtractor.from_pretrained(config.MODEL_NAME)
-    model = Wav2Vec2Model.from_pretrained(config.MODEL_NAME).eval()
+    model = Wav2Vec2Model.from_pretrained(config.MODEL_NAME).eval().to(DEVICE)
     torch.set_grad_enabled(False)
+    print(f"Thiết bị: {DEVICE}, {len(paths)} clip", flush=True)
 
     n_chunks = (len(paths) + CHUNK - 1) // CHUNK
     for ci in range(n_chunks):
