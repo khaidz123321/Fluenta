@@ -1,77 +1,98 @@
-"""Đọc nhãn SEP-28k, ghép với các clip đã cắt, gán một nhãn cho mỗi clip và ghi manifest.csv.
+"""Chuyển nhãn SEP-28k thành manifest đơn nhãn R/P/B/I/F.
 
-Quy tắc gán nhãn (bài không mô tả cụ thể, đây là giả định của nhóm):
-  - R = max(SoundRep, WordRep), vì bài gộp hai loại lặp thành một lớp.
-  - Trong R, P, B, I, lớp nào có >= MIN_VOTES phiếu thì ứng viên; chọn lớp nhiều phiếu nhất
-    (hòa thì theo thứ tự R, P, B, I).
-  - Không có lớp lỗi nào đạt ngưỡng mà NoStutteredWords >= MIN_VOTES thì gán F (trôi chảy).
-  - Còn lại (không có tiếng nói, nhạc, không rõ...) thì loại, giống bài bỏ các nhãn không phải nói lắp.
-Manifest vẫn giữ nguyên số phiếu SoundRep/WordRep riêng để sau này chuyển sang 6 nhãn đa nhãn.
+SEP-28k cho phép nhiều nhãn một clip; bài 2306.00689 không công bố quy tắc
+quy đổi. Quy tắc ở đây là giả định tái hiện và được ghi vào metadata JSON.
 """
+
 import argparse
 import csv
+import json
 from collections import Counter
 
 import config
 
-VOTE_COLS = ["Unsure", "PoorAudioQuality", "Prolongation", "Block", "SoundRep", "WordRep",
-             "DifficultToUnderstand", "Interjection", "NoStutteredWords", "NaturalPause", "Music", "NoSpeech"]
+VOTE_COLS = (
+    "Unsure", "PoorAudioQuality", "Prolongation", "Block", "SoundRep",
+    "WordRep", "DifficultToUnderstand", "Interjection", "NoStutteredWords",
+    "NaturalPause", "Music", "NoSpeech",
+)
+FIELDS = ("path", "show", "ep_id", "clip_id", "group", "label", *VOTE_COLS)
 
 
 def assign_label(v):
-    votes = {"R": max(v["SoundRep"], v["WordRep"]), "P": v["Prolongation"],
-             "B": v["Block"], "I": v["Interjection"]}
-    passed = [c for c in config.DISFLUENT if votes[c] >= config.MIN_VOTES]
-    if passed:
-        return max(passed, key=lambda c: votes[c])
-    if v["NoStutteredWords"] >= config.MIN_VOTES:
-        return "F"
-    return None
+    # Suy ra từ Bảng 1: giữ đúng một loại lỗi có >=2 phiếu; loại đa loại lỗi.
+    votes = {
+        "R": max(v["SoundRep"], v["WordRep"]),
+        "P": v["Prolongation"],
+        "B": v["Block"],
+        "I": v["Interjection"],
+    }
+    eligible = [c for c in config.DISFLUENT if votes[c] >= config.MIN_VOTES]
+    if len(eligible) == 1:
+        return eligible[0]
+    if len(eligible) > 1:
+        return None
+    return "F" if v["NoStutteredWords"] >= config.MIN_VOTES else None
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=0, help="chỉ lấy N clip đầu tiên có file (để chạy thử)")
-    ap.add_argument("--per-class", type=int, default=0,
-                    help="chỉ lấy N clip đầu tiên của mỗi lớp (chạy thử có đủ các lớp)")
-    args = ap.parse_args()
-    taken = Counter()
+def build_manifest(limit=0, per_class=0):
+    if not config.LABELS_CSV.is_file():
+        raise FileNotFoundError(f"Thiếu {config.LABELS_CSV}")
+    if not config.CLIPS_DIR.is_dir():
+        raise FileNotFoundError(f"Thiếu {config.CLIPS_DIR}")
 
-    config.WORK_DIR.mkdir(parents=True, exist_ok=True)
-    rows_out, n_missing, n_dropped = [], 0, 0
-    with open(config.LABELS_CSV, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f, skipinitialspace=True):
-            show, ep, clip = r["Show"].strip(), r["EpId"].strip(), r["ClipId"].strip()
+    rows, counts = [], Counter()
+    with config.LABELS_CSV.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream, skipinitialspace=True):
+            show, ep, clip = (row[col].strip() for col in ("Show", "EpId", "ClipId"))
             path = config.CLIPS_DIR / show / ep / f"{show}_{ep}_{clip}.wav"
-            if not path.exists():
-                n_missing += 1
+            counts["total"] += 1
+            if not path.is_file():
+                counts["missing_audio"] += 1
                 continue
-            v = {c: int(r[c]) for c in VOTE_COLS}
-            label = assign_label(v)
+            votes = {col: int(row[col]) for col in VOTE_COLS}
+            label = assign_label(votes)
             if label is None:
-                n_dropped += 1
+                counts["excluded"] += 1
                 continue
-            if args.per_class and taken[label] >= args.per_class:
+            if per_class and counts[label] >= per_class:
                 continue
-            taken[label] += 1
-            rows_out.append({"path": str(path), "show": show, "ep_id": ep, "clip_id": clip,
-                             "group": f"{show}_{ep}", "label": label, **v})
-            if args.limit and len(rows_out) >= args.limit:
+            rows.append({
+                "path": str(path.resolve()), "show": show, "ep_id": ep,
+                "clip_id": clip, "group": f"{show}_{ep}", "label": label, **votes,
+            })
+            counts[label] += 1
+            if limit and len(rows) >= limit:
                 break
-            if args.per_class and all(taken[c] >= args.per_class for c in config.CLASSES):
+            if per_class and all(counts[c] >= per_class for c in config.CLASSES):
                 break
 
-    with open(config.MANIFEST, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows_out[0].keys()))
-        w.writeheader()
-        w.writerows(rows_out)
-
-    dist = Counter(r["label"] for r in rows_out)
-    print(f"Đã ghi {len(rows_out)} clip vào {config.MANIFEST}")
-    print(f"Bỏ qua: {n_missing} dòng nhãn không có file clip, {n_dropped} clip không đủ phiếu cho lớp nào")
-    print("Phân bố nhãn:", {c: dist.get(c, 0) for c in config.CLASSES})
-    print("Số nhóm podcast (tập):", len({r['group'] for r in rows_out}))
+    if not rows:
+        raise ValueError("Không có clip hợp lệ. Kiểm tra SEP_DIR và cấu trúc clips_output.")
+    config.WORK_DIR.mkdir(parents=True, exist_ok=True)
+    with config.MANIFEST.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    metadata = {
+        "dataset": str(config.SEP_DIR.resolve()),
+        "label_rule": "exactly one R/P/B/I with >=2 votes; else F if NoStutteredWords>=2; R=max(sound,word)",
+        "counts": dict(counts),
+        "rows": len(rows),
+        "podcast_episodes": len({row["group"] for row in rows}),
+    }
+    config.MANIFEST.with_suffix(".json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"Manifest: {config.MANIFEST} ({len(rows)} clip)")
+    print(f"Thiếu audio: {counts['missing_audio']}; loại theo nhãn: {counts['excluded']}")
+    print("Phân bố:", {c: counts[c] for c in config.CLASSES})
+    print("Số tập podcast:", metadata["podcast_episodes"])
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--per-class", type=int, default=0)
+    args = parser.parse_args()
+    build_manifest(args.limit, args.per_class)

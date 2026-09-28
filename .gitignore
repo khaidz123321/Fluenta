@@ -22,3 +22,6 @@ __pycache__/
 
 # Khóa API, không bao giờ đưa lên git
 kaggle.json
+
+# Kết quả tải về từ Kaggle (chỉ giữ trên máy)
+baseline_sheikh/kaggle_output*/

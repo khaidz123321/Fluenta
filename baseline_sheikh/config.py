@@ -1,43 +1,56 @@
-"""Cấu hình chung để tái hiện Sheikh et al. (2023), arXiv:2306.00689, trên SEP-28k."""
+"""Sheikh et al. (2023), arXiv:2306.00689 -- cấu hình tái hiện.
+
+Các thông số bài công bố được giữ nguyên. Lựa chọn khác được ghi trong README.
+"""
+
+import hashlib
 import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-# Trên Kaggle/Modal, đặt FLUENTA_SEP_DIR tới thư mục chứa SEP-28k_labels.csv và clips_output/.
-SEP_DIR = Path(os.environ.get(
-    "FLUENTA_SEP_DIR",
-    ROOT.parent / "Dataset" / "ml-stuttering-events-dataset-main" / "ml-stuttering-events-dataset-main"))
-LABELS_CSV = SEP_DIR / "SEP-28k_labels.csv"
-CLIPS_DIR = SEP_DIR / "clips_output"
+PIPELINE_VERSION = 3
+SEP_DIR = Path(os.environ.get("FLUENTA_SEP_DIR", ROOT / "ml-stuttering-events-dataset"))
+LABELS_CSV = Path(os.environ.get("FLUENTA_LABELS_CSV", SEP_DIR / "SEP-28k_labels.csv"))
+CLIPS_DIR = Path(os.environ.get("FLUENTA_CLIPS_DIR", SEP_DIR / "clips_output"))
 
 WORK_DIR = Path(os.environ.get("FLUENTA_WORK_DIR", ROOT / "work"))
 MANIFEST = WORK_DIR / "manifest.csv"
-FEATURE_DIR = WORK_DIR / "features"
+FEATURE_ROOT = WORK_DIR / "features"
 RESULTS_DIR = WORK_DIR / "results"
 
-# wav2vec2-base pretrain 960h LibriSpeech rồi finetune ASR (CTC), đúng mô tả của bài.
-MODEL_NAME = "facebook/wav2vec2-base-960h"
-SAMPLE_RATE = 16000
+# Bài: Wav2Vec2 base 960 h LibriSpeech rồi fine-tune ASR; ECAPA trên VoxCeleb.
+W2V_MODEL = "facebook/wav2vec2-base-960h"
+ECAPA_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+SAMPLE_RATE = 16_000
+ALL_LAYERS = tuple(f"L{i}" for i in range(1, 14))
+FUSION_LAYERS = ("L1", "L7", "L11")
 
-# Bài đánh số L1 = local encoder, L2..L13 = 12 lớp transformer.
-# Với HuggingFace, hidden_states[0] là đầu ra local encoder, hidden_states[k] là lớp transformer thứ k,
-# nên L_k tương ứng hidden_states[k - 1].
-LAYERS = {"L1": 0, "L7": 6, "L11": 10}
-
-# R = lặp (bài gộp SoundRep + WordRep), P = kéo dài âm, B = khựng, I = chêm từ, F = trôi chảy.
-CLASSES = ["R", "P", "B", "I", "F"]
-DISFLUENT = ["R", "P", "B", "I"]
-MIN_VOTES = 2  # một nhãn được tính khi có từ 2/3 người gán đồng ý
-
+# Bài: năm lớp R/P/B/I/F, LDA 4 chiều trên từng embedding.
+CLASSES = ("R", "P", "B", "I", "F")
+DISFLUENT = CLASSES[:4]
 LDA_COMPONENTS = 4
-BATCH_SIZE = 128
-LR = 1e-2
-PATIENCE = 7
-MAX_EPOCHS = 200
-DROPOUT = 0.2
-HIDDEN = (64, 32)  # bài không nêu số nơ-ron lớp ẩn; đây là giả định của nhóm
 KNN_K = 5
-
+NN_BATCH_SIZE = 128
+NN_LR = 1e-2
+NN_PATIENCE = 7
+NN_DROPOUT = 0.2
 N_FOLDS = 10
-TRAIN_FRAC, VAL_FRAC = 0.8, 0.1
-SEED = 0
+TRAIN_FRAC = 0.8
+VAL_FRAC = 0.1
+
+# Bài không công bố quy tắc quy đổi nhãn đa nhãn và kích thước lớp ẩn.
+MIN_VOTES = 2
+HIDDEN_CANDIDATES = ((64, 32), (128, 64))
+MAX_EPOCHS = 120
+SEED = 2023
+SCORE_ALPHA = 0.9  # Giá trị bài nêu; giữ cố định, không tối ưu trên test.
+
+
+def feature_dir():
+    """Cache gắn với manifest và phiên bản bộ trích đặc trưng."""
+    if not MANIFEST.is_file():
+        raise FileNotFoundError(f"Chưa có manifest: {MANIFEST}. Chạy prepare_data.py trước.")
+    digest = hashlib.sha256()
+    digest.update(MANIFEST.read_bytes())
+    digest.update(f"v{PIPELINE_VERSION}|{W2V_MODEL}|{ECAPA_MODEL}|{SAMPLE_RATE}".encode())
+    return FEATURE_ROOT / digest.hexdigest()[:16]

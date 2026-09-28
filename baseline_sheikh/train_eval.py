@@ -1,160 +1,297 @@
-"""Huấn luyện và đánh giá theo Sheikh et al. (2023).
+"""Đánh giá các cấu hình trong Bảng 2 của Sheikh et al. (2023).
 
-Mỗi fold: chia theo tập podcast (không trùng giữa train/val/test) -> LDA 4 chiều cho từng lớp wav2vec2,
-fit trên train -> ghép các lớp -> 3 bộ phân loại: mạng hai nhánh (NN), KNN (k=5), Gaussian Naive Bayes.
-Báo recall và F1 từng lớp, UAR (trung bình recall 5 lớp) và độ chính xác, lấy trung bình qua các fold.
+Mỗi lần chia giữ nguyên toàn bộ tập podcast giữa train/val/test. LDA và lựa
+chọn kích thước NN chỉ dùng train/validation; test dùng đúng một lần.
 """
+
 import argparse
 import csv
 import json
-
 import numpy as np
 import torch
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.metrics import accuracy_score, f1_score, recall_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, recall_score
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 
 import config
-from model import TwoBranchNet, loss_fn, predict
+from model import TwoBranchNet, loss_fn, predict, probabilities
 
-assert config.DISFLUENT == config.CLASSES[:4], "nhánh lỗi dùng chỉ số 0..3 của CLASSES"
-
-
-def load_data(layers):
-    with open(config.MANIFEST, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    y = np.array([config.CLASSES.index(r["label"]) for r in rows])
-    groups = np.array([r["group"] for r in rows])
-    feats = {name: np.load(config.FEATURE_DIR / f"{name}.npy") for name in layers}
-    return feats, y, groups
+CORE_EXPERIMENTS = ("l11", "multilevel", "ecapa", "score_fusion", "embedding_fusion")
+OPTIONAL_EXPERIMENTS = ("l11_raw", "ecapa_raw", "layer_scan")
+METHODS = ("NN", "KNN", "NBC")
 
 
-def make_split(y, groups, fold, mode):
-    rng = np.random.default_rng(config.SEED + fold)
-    units = np.unique(groups) if mode == "podcast" else np.arange(len(y))
-    units = rng.permutation(units)
-    n_tr = int(round(len(units) * config.TRAIN_FRAC))
-    n_va = int(round(len(units) * config.VAL_FRAC))
-    tr_u, va_u, te_u = units[:n_tr], units[n_tr:n_tr + n_va], units[n_tr + n_va:]
-    if mode == "podcast":
-        return np.isin(groups, tr_u), np.isin(groups, va_u), np.isin(groups, te_u)
-    masks = [np.zeros(len(y), bool) for _ in range(3)]
-    for m, u in zip(masks, (tr_u, va_u, te_u)):
-        m[u] = True
-    return masks
+def load_manifest():
+    with config.MANIFEST.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows:
+        raise ValueError("Manifest rỗng.")
+    y = np.array([config.CLASSES.index(row["label"]) for row in rows], dtype=np.int64)
+    groups = np.array([row["group"] for row in rows])
+    return y, groups
 
 
-def lda_features(feats, y, tr):
-    n_comp = min(config.LDA_COMPONENTS, len(np.unique(y[tr])) - 1)
-    out = []
-    for arr in feats.values():
-        lda = LinearDiscriminantAnalysis(n_components=n_comp).fit(arr[tr], y[tr])
-        out.append(lda.transform(arr))
-    return np.concatenate(out, axis=1).astype(np.float32)
+def make_split(groups, fold, seed):
+    """10 lần chia độc lập 80/10/10 theo podcast; protocol gốc chưa phát hành."""
+    rng = np.random.default_rng(seed + fold)
+    units = rng.permutation(np.unique(groups))
+    n_train = round(len(units) * config.TRAIN_FRAC)
+    n_val = round(len(units) * config.VAL_FRAC)
+    train = np.isin(groups, units[:n_train])
+    val = np.isin(groups, units[n_train:n_train + n_val])
+    test = np.isin(groups, units[n_train + n_val:])
+    return train, val, test
 
 
-def train_nn(X, y, tr, va):
-    torch.manual_seed(config.SEED)
-    model = TwoBranchNet(X.shape[1])
-    opt = torch.optim.Adam(model.parameters(), lr=config.LR)
-    Xtr, ytr = torch.from_numpy(X[tr]), torch.from_numpy(y[tr])
-    Xva, yva = torch.from_numpy(X[va]), torch.from_numpy(y[va])
-    best, best_state, bad = float("inf"), None, 0
-    for _ in range(config.MAX_EPOCHS):
-        model.train()
-        perm = torch.randperm(len(Xtr))
-        for i in range(0, len(Xtr), config.BATCH_SIZE):
-            idx = perm[i:i + config.BATCH_SIZE]
-            if len(idx) < 2:  # BatchNorm cần ít nhất 2 mẫu
-                continue
-            opt.zero_grad()
-            loss_fn(*model(Xtr[idx]), ytr[idx]).backward()
-            opt.step()
-        model.eval()
-        with torch.no_grad():
-            val_loss = loss_fn(*model(Xva), yva).item()
-        if val_loss < best:
-            best, bad = val_loss, 0
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-        else:
-            bad += 1
-            if bad >= config.PATIENCE:
-                break
-    model.load_state_dict(best_state)
-    return model
+def load_features(names, n_rows):
+    cache = config.feature_dir()
+    arrays = {}
+    for name in sorted(names):
+        path = cache / f"{name}.npy"
+        if not path.is_file():
+            raise FileNotFoundError(f"Thiếu {path}; chạy extract_features.py trước.")
+        array = np.load(path, mmap_mode="r")
+        if array.ndim != 2 or len(array) != n_rows:
+            raise ValueError(f"Feature không khớp manifest: {path} {array.shape}")
+        arrays[name] = array
+    return arrays
 
 
-def metrics(y_true, y_pred):
+def lda_transform(array, y, train):
+    if set(np.unique(y[train])) != set(range(len(config.CLASSES))):
+        raise ValueError("Tập train cần có đủ cả 5 lớp để LDA ra 4 chiều.")
+    lda = LinearDiscriminantAnalysis(n_components=config.LDA_COMPONENTS)
+    lda.fit(array[train], y[train])
+    result = lda.transform(array).astype(np.float32)
+    if result.shape[1] != config.LDA_COMPONENTS:
+        raise ValueError(f"LDA ra {result.shape[1]} chiều, cần 4 chiều.")
+    return result
+
+
+def fit_nn(X, y, train, val, fold, device):
+    X_train = torch.as_tensor(np.asarray(X[train]), dtype=torch.float32, device=device)
+    y_train = torch.as_tensor(y[train], dtype=torch.long, device=device)
+    X_val = torch.as_tensor(np.asarray(X[val]), dtype=torch.float32, device=device)
+    y_val = torch.as_tensor(y[val], dtype=torch.long, device=device)
+    best_choice = None
+    for choice, hidden in enumerate(config.HIDDEN_CANDIDATES):
+        torch.manual_seed(config.SEED + fold * 100 + choice)
+        model = TwoBranchNet(X.shape[1], hidden).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.NN_LR)
+        best_loss, best_state, bad, best_epoch = float("inf"), None, 0, 0
+        for epoch in range(config.MAX_EPOCHS):
+            model.train()
+            order = torch.randperm(len(X_train), device=device)
+            for start in range(0, len(order), config.NN_BATCH_SIZE):
+                ids = order[start:start + config.NN_BATCH_SIZE]
+                if len(ids) < 2:
+                    continue  # BatchNorm yêu cầu ít nhất hai mẫu.
+                optimizer.zero_grad(set_to_none=True)
+                loss_fn(*model(X_train[ids]), y_train[ids]).backward()
+                optimizer.step()
+            model.eval()
+            with torch.no_grad():
+                val_loss = loss_fn(*model(X_val), y_val).item()
+            if val_loss < best_loss:
+                best_loss, bad, best_epoch = val_loss, 0, epoch + 1
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                bad += 1
+                if bad >= config.NN_PATIENCE:
+                    break
+        if best_choice is None or best_loss < best_choice[0]:
+            best_choice = (best_loss, hidden, best_epoch, best_state)
+    loss, hidden, epoch, state = best_choice
+    model = TwoBranchNet(X.shape[1], hidden).to(device)
+    model.load_state_dict(state)
+    model.eval()
+    return model, {"hidden": list(hidden), "epoch": epoch, "validation_loss": loss}
+
+
+def aligned_probabilities(raw, classes):
+    aligned = np.zeros((len(raw), len(config.CLASSES)), dtype=np.float32)
+    aligned[:, classes] = raw
+    return aligned
+
+
+def fit_classifiers(X, y, train, val, test, fold, device, name, checkpoint_dir):
+    output, selection = {}, {}
+    nn, details = fit_nn(X, y, train, val, fold, device)
+    selection["NN"] = details
+    state = {k: v.detach().cpu() for k, v in nn.state_dict().items()}
+    torch.save({"state_dict": state, "input_dim": X.shape[1],
+                "hidden": details["hidden"], "classes": config.CLASSES},
+               checkpoint_dir / f"{name}_fold{fold + 1:02d}.pt")
+    with torch.no_grad():
+        x_test = torch.as_tensor(np.asarray(X[test]), dtype=torch.float32, device=device)
+        output["NN"] = {
+            "pred": predict(nn, x_test).cpu().numpy(),
+            "prob": probabilities(nn, x_test).cpu().numpy(),
+        }
+    knn = KNeighborsClassifier(n_neighbors=config.KNN_K, metric="minkowski", p=2)
+    knn.fit(X[train], y[train])
+    output["KNN"] = {
+        "pred": knn.predict(X[test]),
+        "prob": aligned_probabilities(knn.predict_proba(X[test]), knn.classes_),
+    }
+    nbc = GaussianNB()
+    nbc.fit(X[train], y[train])
+    output["NBC"] = {
+        "pred": nbc.predict(X[test]),
+        "prob": aligned_probabilities(nbc.predict_proba(X[test]), nbc.classes_),
+    }
+    return output, selection
+
+
+def metrics(true, predicted):
     labels = list(range(len(config.CLASSES)))
-    present = [c for c in labels if (y_true == c).any()]
-    rec = recall_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
-    f1 = f1_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
+    recall = recall_score(true, predicted, labels=labels, average=None, zero_division=0)
+    f1 = f1_score(true, predicted, labels=labels, average=None, zero_division=0)
     return {
-        "recall": {config.CLASSES[c]: float(rec[c]) for c in labels},
-        "f1": {config.CLASSES[c]: float(f1[c]) for c in labels},
-        "UAR": float(np.mean([rec[c] for c in present])),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "classes_in_test": [config.CLASSES[c] for c in present],
+        "recall": dict(zip(config.CLASSES, map(float, recall))),
+        "f1": dict(zip(config.CLASSES, map(float, f1))),
+        "UAR": float(recall.mean()),
+        "accuracy": float(accuracy_score(true, predicted)),
+        "confusion_matrix": confusion_matrix(true, predicted, labels=labels).tolist(),
+        "support": dict(zip(config.CLASSES, map(int, np.bincount(true, minlength=5)))),
     }
 
 
-def average(fold_results):
-    avg = {}
-    for key in ("recall", "f1"):
-        avg[key] = {c: float(np.mean([r[key][c] for r in fold_results])) for c in config.CLASSES}
-    avg["UAR"] = float(np.mean([r["UAR"] for r in fold_results]))
-    avg["accuracy"] = float(np.mean([r["accuracy"] for r in fold_results]))
-    return avg
+def summary(folds):
+    return {
+        "recall": {c: float(np.mean([item["recall"][c] for item in folds]))
+                   for c in config.CLASSES},
+        "f1": {c: float(np.mean([item["f1"][c] for item in folds]))
+               for c in config.CLASSES},
+        "UAR": float(np.mean([item["UAR"] for item in folds])),
+        "accuracy": float(np.mean([item["accuracy"] for item in folds])),
+    }
+
+
+def experiment_plan(selected):
+    selected = set(selected)
+    if "layer_scan" in selected:
+        selected.remove("layer_scan")
+        selected.update(f"layer_{layer.lower()}" for layer in config.ALL_LAYERS)
+    allowed = set(CORE_EXPERIMENTS + OPTIONAL_EXPERIMENTS) | {
+        f"layer_{layer.lower()}" for layer in config.ALL_LAYERS
+    }
+    if not selected or not selected <= allowed:
+        raise ValueError(f"Thí nghiệm không hợp lệ: {sorted(selected - allowed)}")
+    names = {"L11"} if selected & {"l11", "l11_raw", "score_fusion", "embedding_fusion"} else set()
+    if selected & {"multilevel"}:
+        names.update(config.FUSION_LAYERS)
+    if selected & {"ecapa", "ecapa_raw", "score_fusion", "embedding_fusion"}:
+        names.add("ecapa")
+    names.update(name[6:].upper() for name in selected if name.startswith("layer_"))
+    return sorted(selected), names
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--layers", default="L1,L7,L11", help="vd. 'L11' hoặc 'L1,L7,L11'")
-    ap.add_argument("--folds", type=int, default=config.N_FOLDS)
-    ap.add_argument("--split", choices=["podcast", "random"], default="podcast",
-                    help="'random' chỉ dùng khi chạy thử với rất ít clip")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--experiments", default=",".join(CORE_EXPERIMENTS),
+                        help="l11,multilevel,ecapa,score_fusion,embedding_fusion; "
+                             "thêm l11_raw,ecapa_raw,layer_scan nếu cần")
+    parser.add_argument("--folds", type=int, default=config.N_FOLDS)
+    parser.add_argument("--seed", type=int, default=config.SEED)
+    args = parser.parse_args()
+    if args.folds < 1:
+        parser.error("--folds phải dương")
+    selected, needed = experiment_plan([x.strip() for x in args.experiments.split(",")])
+    y, groups = load_manifest()
+    features = load_features(needed, len(y))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    result_dir = config.RESULTS_DIR / config.feature_dir().name / f"seed_{args.seed}"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = result_dir / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
+    results = {name: {method: [] for method in METHODS} for name in selected}
+    splits, tuning = [], []
+    print(f"{len(y)} clip; {len(np.unique(groups))} tập; {device}; {selected}", flush=True)
 
-    layers = [l.strip() for l in args.layers.split(",")]
-    feats, y, groups = load_data(layers)
-    print(f"{len(y)} clip, lớp wav2vec2: {layers}, chia theo: {args.split}, số fold: {args.folds}")
-
-    results = {"NN+LDA": [], "KNN+LDA": [], "NBC+LDA": []}
     for fold in range(args.folds):
-        tr, va, te = make_split(y, groups, fold, args.split)
-        if len(np.unique(y[tr])) < 2 or va.sum() == 0 or te.sum() == 0:
-            print(f"Fold {fold}: bỏ qua vì tập train/val/test quá nhỏ")
-            continue
-        X = lda_features(feats, y, tr)
-        nn_model = train_nn(X, y, tr, va)
-        preds = {
-            "NN+LDA": predict(nn_model, torch.from_numpy(X[te])).numpy(),
-            "KNN+LDA": KNeighborsClassifier(n_neighbors=min(config.KNN_K, int(tr.sum())))
-            .fit(X[tr], y[tr]).predict(X[te]),
-            "NBC+LDA": GaussianNB().fit(X[tr], y[tr]).predict(X[te]),
-        }
-        for name, p in preds.items():
-            results[name].append(metrics(y[te], p))
-        print(f"Fold {fold}: train {tr.sum()}, val {va.sum()}, test {te.sum()} | "
-              + ", ".join(f"{n} UAR {results[n][-1]['UAR'] * 100:.1f}%" for n in results))
+        train, val, test = make_split(groups, fold, args.seed)
+        if not train.any() or not val.any() or not test.any() or len(np.unique(y[train])) != 5:
+            raise ValueError(f"Fold {fold + 1} không đủ dữ liệu cho năm lớp và ba tập.")
+        split = {"fold": fold + 1, "train": int(train.sum()), "val": int(val.sum()),
+                 "test": int(test.sum()), "train_groups": int(len(np.unique(groups[train]))),
+                 "val_groups": int(len(np.unique(groups[val]))),
+                 "test_groups": int(len(np.unique(groups[test])))}
+        splits.append(split)
+        representations = {}
+        if "L11" in needed:
+            representations["l11"] = lda_transform(features["L11"], y, train)
+        if "ecapa" in needed:
+            representations["ecapa"] = lda_transform(features["ecapa"], y, train)
+        if "multilevel" in selected:
+            transformed = {layer: (representations["l11"] if layer == "L11"
+                                   else lda_transform(features[layer], y, train))
+                           for layer in config.FUSION_LAYERS}
+            representations["multilevel"] = np.concatenate(
+                [transformed[layer] for layer in config.FUSION_LAYERS], axis=1)
+        if "embedding_fusion" in selected:
+            representations["embedding_fusion"] = np.concatenate(
+                [representations["l11"], representations["ecapa"]], axis=1)
+        if "l11_raw" in selected:
+            representations["l11_raw"] = features["L11"]
+        if "ecapa_raw" in selected:
+            representations["ecapa_raw"] = features["ecapa"]
+        for name in selected:
+            if name.startswith("layer_"):
+                layer = name[6:].upper()
+                representations[name] = (representations["l11"] if layer == "L11"
+                                         and "l11" in representations else
+                                         lda_transform(features[layer], y, train))
 
-    if not results["NN+LDA"]:
-        print("Không có fold nào chạy được.")
-        return
+        fitted = {}
+        needed_reps = [name for name in representations if name in selected]
+        if "score_fusion" in selected:
+            needed_reps += [name for name in ("l11", "ecapa") if name not in needed_reps]
+        for name in needed_reps:
+            fitted[name], chosen = fit_classifiers(
+                representations[name], y, train, val, test, fold, device, name, checkpoint_dir)
+            tuning.append({"fold": fold + 1, "experiment": name, **chosen["NN"]})
 
-    summary = {name: average(r) for name, r in results.items()}
-    print("\nKết quả trung bình (recall % từng lớp như cách trình bày ở Bảng 2 của bài):")
-    print(f"{'Mô hình':10s} " + " ".join(f"{c:>6s}" for c in config.CLASSES) + f" {'Acc':>6s} {'UAR':>6s}")
-    for name, s in summary.items():
-        print(f"{name:10s} " + " ".join(f"{s['recall'][c] * 100:6.1f}" for c in config.CLASSES)
-              + f" {s['accuracy'] * 100:6.1f} {s['UAR'] * 100:6.1f}")
+        for name in selected:
+            for method in METHODS:
+                if name == "score_fusion":
+                    score = (config.SCORE_ALPHA * fitted["l11"][method]["prob"]
+                             + (1 - config.SCORE_ALPHA) * fitted["ecapa"][method]["prob"])
+                    predicted = score.argmax(axis=1)
+                else:
+                    predicted = fitted[name][method]["pred"]
+                results[name][method].append(metrics(y[test], predicted))
+        print(f"Fold {fold + 1}/{args.folds}: {split['train']}/{split['val']}/{split['test']} "
+              f"| NN L11 UAR {results['l11']['NN'][-1]['UAR']:.3f}"
+              if "l11" in results else f"Fold {fold + 1}/{args.folds} xong", flush=True)
 
-    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = config.RESULTS_DIR / f"results_{'-'.join(layers)}_{args.split}_{args.folds}folds.json"
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump({"args": vars(args), "summary": summary, "per_fold": results}, f, ensure_ascii=False, indent=2)
-    print(f"\nĐã lưu chi tiết vào {out}")
+    report = {
+        "paper": "Sheikh et al. 2023, arXiv:2306.00689v1",
+        "manifest": str(config.MANIFEST),
+        "feature_cache": str(config.feature_dir()),
+        "pretrained_models": {"wav2vec2": config.W2V_MODEL, "ecapa": config.ECAPA_MODEL},
+        "assumptions": {
+            "label_rule": "exactly one R/P/B/I with >=2 votes; else F if NoStutteredWords>=2",
+            "splits": "10 repeated seeded 80/10/10 podcast-level splits; original IDs unavailable",
+            "hidden_candidates": config.HIDDEN_CANDIDATES,
+            "max_epochs": config.MAX_EPOCHS,
+            "score_alpha": config.SCORE_ALPHA,
+            "score_alpha_policy": "fixed paper value, not tuned on test",
+        },
+        "args": vars(args), "splits": splits, "nn_selection": tuning,
+        "summary": {name: {method: summary(folds) for method, folds in methods.items()}
+                    for name, methods in results.items()},
+        "per_fold": results,
+    }
+    output = result_dir / f"results_{'-'.join(selected)}_{args.folds}folds.json"
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("\nExperiment / classifier        Accuracy       UAR")
+    for name in selected:
+        for method in METHODS:
+            scores = report["summary"][name][method]
+            print(f"{name + ' / ' + method:28s} {scores['accuracy'] * 100:7.2f}%  {scores['UAR'] * 100:7.2f}%")
+    print(f"\nChi tiết: {output}")
 
 
 if __name__ == "__main__":
